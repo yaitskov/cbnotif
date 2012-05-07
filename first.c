@@ -4,6 +4,8 @@
 #include <linux/moduleparam.h>
 #include <linux/fs.h>
 #include <linux/mutex.h>
+#include <linux/slab.h>
+#include <linux/syscalls.h>
 
 #define DRIVER_AUTHOR "Daneel S. Yaitskov <rtfm.rtfm.rtfm@gmail.com>"
 #define DRIVER_DESC   "Changed file blocks notifier"
@@ -125,33 +127,39 @@ static void __exit first_cleanup(void) {
 }
 
 static int open_device(struct inode * inode, struct file * file) {
-  first_monitoring_process * mp = &mp_list;
-  long pid = sys_getpid();
-  printk(KERN_INFO "first: open_device inode = %p; file = %p; pid = %ld\n", inode, file, pid);
+  struct list_head * mp;
+  struct first_monitoring_process * _mp;
+  struct task_struct * task;
+  pid_t pid;
+  task = get_current();
+  pid = task->pid;
+  printk(KERN_INFO "first: open_device inode = %p; file = %p; pid = %d\n", inode, file, pid);
   
   mutex_lock(&mp_list_mutex);
-  list_for_each(mp, &mp_list) 
-    if (mp->pid == pid) {
-      printk(KERN_INFO "first: process %ld already opened this file driver\n", pid);
+  list_for_each(mp, &mp_list) {
+    _mp = (struct first_monitoring_process *)mp;
+    if (_mp->pid == pid) {
+      printk(KERN_INFO "first: process %d already opened this file driver\n", pid);
       break;
     }
+  }
 
   if (&mp_list == mp) {
     // add new
-    mp = (struct first_monitoring_process *)kmalloc(sizeof(struct first_monitoring_process), GFP_KERNEL);
-    if (!mp) {
+    _mp = (struct first_monitoring_process *)kmalloc(sizeof(struct first_monitoring_process), GFP_KERNEL);
+    if (!_mp) {
       printk(KERN_ALERT "first: no memory\n");
-      mutex_ulock(&mp_list_mutex);
-      return -NOMEM;
+      mutex_unlock(&mp_list_mutex);
+      return -ENOMEM;
     }
-    mutex_init(&mp->mp_mutex);
-    mp->pid = pid;
-    LIST_INIT_HEAD(&mp->list_head);
+    mutex_init(&_mp->mp_mutex);
+    _mp->pid = pid;
+    INIT_LIST_HEAD(&_mp->next_process);
     try_module_get(THIS_MODULE);
-    list_add(mp, &mp_list);
-    printk(KERN_INFO "first: process %ld successfully opened file\n", pid);    
+    list_add((struct list_head*)_mp, &mp_list);
+    printk(KERN_INFO "first: process %d successfully opened file\n", pid);    
   } else {
-    printk(KERN_INFO "first: process %ld already opened file\n", pid);        
+    printk(KERN_INFO "first: process %d already opened file\n", pid);        
   }
 
   mutex_unlock(&mp_list_mutex);
@@ -159,47 +167,58 @@ static int open_device(struct inode * inode, struct file * file) {
 }
 
 static int release_device(struct inode * inode, struct file * file) {
-  long pid = sys_getpid();
-  struct first_monitoring_process * mp;
-  struct first_monitored_inode    * mi, * pmi = 0;
-  printk(KERN_INFO "first: release_device inode = %p; file = %p; pid = %ld\n", inode, file, pid);
+  struct list_head * mp, * mi;
+  struct first_monitoring_process * _mp;
+  struct first_monitored_inode    * _mi;
+  struct file_operations * fops;  
+  pid_t pid = get_current()->pid;
+  printk(KERN_INFO "first: release_device inode = %p; file = %p; pid = %d\n", inode, file, pid);
 
   mutex_lock(&mp_list_mutex);
   if (list_empty(&mp_list)) {
-    printk(KERN_WARN "first: something wong - close closed file pid = %ld\n", pid);
+    printk(KERN_WARNING "first: something wong - close closed file pid = %d\n", pid);
     mutex_unlock(&mp_list_mutex);
     return -EBADF;
   }
 
   list_for_each(mp, &mp_list) {
-    if (mp->pid == pid) {
+    _mp = (struct first_monitoring_process*)mp;
+    if (_mp->pid == pid) {
       break;
     }
   }
+  if (&mp_list == mp) {
+    printk(KERN_WARNING "first: something wong - close closed file pid = %d\n", pid);    
+    mutex_unlock(&mp_list_mutex);
+    return -EBADF;
+  }    
   list_del(mp);
   mutex_unlock(&mp_list_mutex);
-  printk(KERN_INFO "first: process %ld is removed from the list\n", pid);
-  mutex_lock(&mp->mp_mutex);
+  printk(KERN_INFO "first: process %d is removed from the list\n", pid);
+  mutex_lock(&_mp->mp_mutex);
   // need to ensure that other threads of current process already gone.
-  list_for_each(mi, &mp->monitored_inodes) {
-    if (mi->prev != &mp->monitored_inodes) {
+  list_for_each(mi, &_mp->monitored_inodes) {
+    _mi = (struct first_monitored_inode*)mi;
+    if (mi->prev != &_mp->monitored_inodes) {
       kfree(mi->prev);
     }
-    mutex_lock(&mi->mi_mutex);
-    mutex_lock(&mi->inode->i_mutex);
+    mutex_lock(&_mi->mi_mutex);
+    mutex_lock(&_mi->inode->i_mutex);
 
-    mi->inode->i_fop->write = mi->orig_write;
-    mi->inode->i_fop->aio_write = mi->orig_aio_write;
-    mi->inode->i_fop->sendpage = mi->orig_sendpage;
-    mi->inode->i_fop->splice_write = mi->orig_splice_write;    
+    fops = (struct file_operations*)_mi->inode->i_fop;
+    fops->write = _mi->orig_write;
+    fops->aio_write = _mi->orig_aio_write;
+    fops->sendpage = _mi->orig_sendpage;
+    fops->splice_write = _mi->orig_splice_write;    
     
-    mutex_unlock(&mi->inode->i_mutex);    
-    atomic_dec(mi->inode->i_count);
-    mutex_unlock(&mi->mi_mutex);
+    mutex_unlock(&_mi->inode->i_mutex);    
+    atomic_dec(&_mi->inode->i_count);
+    mutex_unlock(&_mi->mi_mutex);
   }
-  if (!list_empty(&mp->monitored_inodes))
-    kfree(mi->prev);
-  mutex_unlock(&mp->mp_mutex);  
+  if (!list_empty(&_mp->monitored_inodes))
+    kfree(mi->prev);  
+  mutex_unlock(&_mp->mp_mutex);
+  module_put(THIS_MODULE);
   kfree(mp);
   
   return SUCCESS;  
@@ -220,36 +239,36 @@ static ssize_t write_inode(struct file * file, const char __user * data, size_t 
   mi = get_mi_by_file(file);
   if (mi) {
     ssize_t (*writep) (struct file *, const char __user *, size_t, loff_t *);
-    writep = mi->orig_wirte;
+    writep = mi->orig_write;
     //mutex_unlock(mi->inode->i_mutex);
-    mutex_unlock(mi);
+    mutex_unlock(&mi->mi_mutex);
     return writep(file, data, len, ofs);    
   }
   return -ENXIO;
 }
 static ssize_t aio_write_inode(struct kiocb * kiocb, const struct iovec * iovec, unsigned long len, loff_t ofs) {
   struct first_monitored_inode * mi = 0;
-  printk(KERN_INFO "first: aio_write_inode file = %p; len = %ul\n", kiocb->ki_filp, len);
-  mi = get_mi_by_file(file);
+  printk(KERN_INFO "first: aio_write_inode file = %p; len = %ld\n", kiocb->ki_filp, len);
+  mi = get_mi_by_file(kiocb->ki_filp);
   if (mi) {
     ssize_t (*aio_writep)(struct kiocb *, const struct iovec *, unsigned long, loff_t);
-    aio_writep = mi->orig_aio_wirte;
+    aio_writep = mi->orig_aio_write;
     //mutex_unlock(mi->inode->i_mutex);
-    mutex_unlock(mi);
+    mutex_unlock(&mi->mi_mutex);
     return aio_writep(kiocb, iovec, len, ofs);    
   }
   return -ENXIO;  
 }
 
-static ssize_t sendpage_inode(struct file *, struct page *, int, size_t, loff_t *, int) {
+static ssize_t sendpage_inode(struct file * file, struct page * page, int i1, size_t s, loff_t * ofs, int i2) {
   struct first_monitored_inode * mi = 0;
-  printk(KERN_INFO "first: aio_write_inode file = %p; len = %ul\n", kiocb->ki_filp, len);
+  printk(KERN_INFO "first: aio_write_inode file = %p\n", file);
   mi = get_mi_by_file(file);
   if (mi) {
-    ssize_t (*sendpagep)(struct file * file, struct page * page, int i1, size_t s, loff_t * ofs, int i2);
+    ssize_t (*sendpagep)(struct file *, struct page *, int, size_t, loff_t *, int);
     sendpagep = mi->orig_sendpage;
     //mutex_unlock(mi->inode->i_mutex);
-    mutex_unlock(mi);
+    mutex_unlock(&mi->mi_mutex);
     return sendpagep(file, page, i1, s, ofs, i2);    
   }
   return -ENXIO;  
@@ -258,13 +277,13 @@ static ssize_t sendpage_inode(struct file *, struct page *, int, size_t, loff_t 
 static ssize_t splice_write_inode(struct pipe_inode_info * pipe, struct file * file,
                                   loff_t * ofs, size_t s, unsigned int ui) {
   struct first_monitored_inode * mi = 0;
-  printk(KERN_INFO "first: aio_write_inode file = %p; len = %ul\n", kiocb->ki_filp, len);
+  printk(KERN_INFO "first: aio_write_inode file = %p\n", file);
   mi = get_mi_by_file(file);
   if (mi) {
     ssize_t (*splice_writep)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
     splice_writep = mi->orig_splice_write;
     //mutex_unlock(mi->inode->i_mutex);
-    mutex_unlock(mi);
+    mutex_unlock(&mi->mi_mutex);
     return splice_writep(pipe, file, ofs, s, ui);    
   }
   return -ENXIO;  
@@ -274,44 +293,48 @@ static ssize_t splice_write_inode(struct pipe_inode_info * pipe, struct file * f
  * @return 0 if not found
  */ 
 static struct first_monitored_inode * get_mi_by_file(struct file * file) {
-  first_monitored_inode * mi;
-  first_monitoring_process * mp;  
+  struct list_head * mi;
+  struct first_monitored_inode * _mi;  
+  struct list_head * mp;
+  struct first_monitoring_process * _mp;  
   int found = 0;
   spin_lock(&file->f_lock);
   printk(KERN_INFO "first: file spin is locked; file = %p;  name = %s\n",
-         file, file->f_path->dentry->d_name->name);
-  spin_lock(&file->f_path->dentry);
+         file, file->f_path.dentry->d_name.name);
+  spin_lock(&file->f_path.dentry->d_lock);
   printk(KERN_INFO "first: dentry spin is locked; file = %p; name = %s\n",
-         file, file->f_path->dentry->d_name->name);
+         file, file->f_path.dentry->d_name.name);
   mutex_lock(&mp_list_mutex);
   // sequential search; slow but simple!
   // FIXME:  one inode can be monitored multiple processes here 
   //         handler is trigged only the first monitor
   printk(KERN_INFO "first: go over list of montors\n");
   list_for_each(mp, &mp_list) {
-    mutex_lock(&mp->mp_mutex);
-    list_for_each(mi, &mp->monitored_inodes) {
-      mutex_lock(&mi->mi_mutex);
-      if (mi->inode == file->f_path->dentry->d_inode) {
+    _mp = (struct first_monitoring_process*)mp;
+    mutex_lock(&_mp->mp_mutex);
+    list_for_each(mi, &_mp->monitored_inodes) {
+      _mi = (struct first_monitored_inode*)mi;
+      mutex_lock(&_mi->mi_mutex);
+      if (_mi->inode == file->f_path.dentry->d_inode) {
         found = 1;        
         break;
       }
-      mutex_unlock(&mi->mi_mutex);
+      mutex_unlock(&_mi->mi_mutex);
     }    
-    mutex_unlock(&mp->mp_mutex);
+    mutex_unlock(&_mp->mp_mutex);
     if (found)
         break;    
   }
   mutex_unlock(&mp_list_mutex);
-  spin_unlock(&file->f_path->dentry);
+  spin_unlock(&file->f_path.dentry->d_lock);
   printk(KERN_INFO "first dentry spin is unlocked; file = %p\n", file); 
   spin_lock(&file->f_lock);
   printk(KERN_INFO "first: file spin is unlocked; file = %p\n", file); 
   if (found) {
-    printk(KERN_INFO "first: inode %p found for file %p\n", mi->inode, file);
-    return mi;    
+    printk(KERN_INFO "first: inode %p found for file %p\n", _mi->inode, file);
+    return _mi;    
   }
-  printk(KERN_INFO "first: inode %p is not found for file %p\n", mi->inode, file);  
+  printk(KERN_INFO "first: inode %p is not found for file %p\n", _mi->inode, file);  
   return 0;
 
 }
