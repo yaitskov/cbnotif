@@ -8,7 +8,7 @@ all:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
 	sudo rmmod first ; echo ok;
 	sudo insmod first.ko
-	sudo tail /var/log/kern.log 
+	sleep 2; sync; sudo tail /var/log/kern.log 
 
 
 clean:

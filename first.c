@@ -6,21 +6,32 @@
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/syscalls.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
 
+// TODO: hook inode_operation.trucate
+
+#define MOD_NAME "first"
 #define DRIVER_AUTHOR "Daneel S. Yaitskov <rtfm.rtfm.rtfm@gmail.com>"
-#define DRIVER_DESC   "Changed file blocks notifier"
+#define DRIVER_DESC   "A notifier of changed file blocks"
 #define SUCCESS 0
+#define FIRST_DEV_NUM 0
+#define DEV_NUM_RANGE 1
 
+// implementation of character device for interface with process
 static int open_device(struct inode *, struct file *);
 static int release_device(struct inode *, struct file *);
 static ssize_t read_device(struct file *, char *, size_t, loff_t *);
 static ssize_t write_device(struct file *, const char *, size_t, loff_t *);
 
+// hooking inode operations
 static ssize_t write_inode(struct file *, const char __user *, size_t, loff_t *);
 static ssize_t aio_write_inode(struct kiocb *, const struct iovec *, unsigned long, loff_t);
 static ssize_t sendpage_inode(struct file *, struct page *, int, size_t, loff_t *, int);
 static ssize_t splice_write_inode(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);  
+
 static struct first_monitored_inode * get_mi_by_file(struct file *);
+
 /**
  * serving process.
  */
@@ -61,69 +72,71 @@ struct first_monitored_inode {
  */
 struct first_dirty_block {
   struct list_head    next;
-  /**
-   * the zero-based number of the first block in the continuous range. 
-   */
-  int                 first;
-  /**
-   * the size of the continuous range in blocks
-   */
-  int                 length;
+  int                 first;  /* the zero-based number of the first block in the continuous range. */
+  int                 length; /* the size of the continuous range in blocks */
 };
 
 //  module vars 
-/**
- * sync mp_list structure modification
- */
-static struct mutex mp_list_mutex;
-/**
- * list of first_monitoring_process
- */
-static struct list_head mp_list;
-
+static struct mutex mp_list_mutex; /* sync mp_list structure modification */
+static struct list_head mp_list;   /* list of first_monitoring_process */
+static dev_t dev_num_region;
+static struct cdev  module_dev;
+static struct class * dev_class;
 /**
  */
-static struct file_operations file_device = {
+static struct file_operations mod_dev_ops = {
   .read = read_device,
   .write = write_device,
   .open = open_device,
   .release = release_device
 };
 
-/**
- * the module params
- */
-static unsigned int device_major = 0;
-static char * device_name = "changed_blocks";
-
-module_param(device_major, uint, 0000);
-MODULE_PARM_DESC(device_major, " the major number of character device; 0 by default");
-module_param(device_name, charp, 0000);
-MODULE_PARM_DESC(device_name, " the character device name; 'changed_blocks' by default");
-
 static int __init first_init(void) {
   int r;
-  printk(KERN_INFO "first: start init\n");
-  printk(KERN_INFO "first: page size: %ld\n", PAGE_SIZE);
-
+  printk(KERN_INFO MOD_NAME ": start init\n");
   mutex_init(&mp_list_mutex);
   INIT_LIST_HEAD(&mp_list);
-  r = register_chrdev(device_major, device_name, &file_device);
+
+  r = alloc_chrdev_region(&dev_num_region, FIRST_DEV_NUM, DEV_NUM_RANGE, "cbnotifier");
   if (r < 0) {
-    printk(KERN_ALERT "first: register_chrdev failed with %d\n", r);
-    return r;
+    printk(KERN_ALERT MOD_NAME ": alloc_chrdev_region = %d\n", r);
+    goto err;
   }
-  if (!device_major)
-    device_major = r;
-  
-  printk(KERN_INFO "first: end init device_major = %d\n", r);
-  return 0;
+  dev_class = class_create(THIS_MODULE, "chardrv");
+  if (!dev_class) {
+    printk(KERN_ALERT MOD_NAME ": class_create return 0\n");
+    r = -EPERM;
+    goto class;
+  }
+  if (!device_create(dev_class, 0, dev_num_region, 0, "cbnotif")) {
+    printk(KERN_ALERT MOD_NAME ": cannot create device of new dev class\n");
+    r = -EPERM;
+    goto device;
+  }
+  cdev_init(&module_dev, &mod_dev_ops);
+  r = cdev_add(&module_dev, dev_num_region, DEV_NUM_RANGE);
+  if (r < 0) {
+    printk(KERN_ALERT MOD_NAME ": cdev_add = %d\n", r);
+    device_destroy(dev_class, dev_num_region);
+    goto device;
+  }
+  printk(KERN_INFO MOD_NAME ": end init device_major = %ul\n", dev_num_region);
+  return SUCCESS;
+ device:
+  class_destroy(dev_class);
+ class:
+  unregister_chrdev_region(dev_num_region, DEV_NUM_RANGE);  
+ err:  
+  return r;
 }
 
 static void __exit first_cleanup(void) {
-  printk(KERN_INFO "first: cleanup with device_major = %d and device_name = %s\n",
-         device_major, device_name);  
-  unregister_chrdev(device_major, device_name);  
+  printk(KERN_INFO MOD_NAME ": cleanup start\n");
+  cdev_del(&module_dev);
+  device_destroy(dev_class, dev_num_region);
+  class_destroy(dev_class);
+  unregister_chrdev_region(dev_num_region, DEV_NUM_RANGE);
+  printk(KERN_INFO MOD_NAME ": cleanup end\n");  
 }
 
 static int open_device(struct inode * inode, struct file * file) {
@@ -290,7 +303,10 @@ static ssize_t splice_write_inode(struct pipe_inode_info * pipe, struct file * f
 }
 
 /**
- * @return 0 if not found
+ * first_monitored_inode - returns first_monitored_inode for the specified file
+ * @file: pointer to the struct file
+ *
+ * Returns 0 if file's inod is not found amoung monitored ones
  */ 
 static struct first_monitored_inode * get_mi_by_file(struct file * file) {
   struct list_head * mi;
@@ -336,8 +352,8 @@ static struct first_monitored_inode * get_mi_by_file(struct file * file) {
   }
   printk(KERN_INFO "first: inode %p is not found for file %p\n", _mi->inode, file);  
   return 0;
-
 }
+
 module_init(first_init);
 module_exit(first_cleanup);
 
