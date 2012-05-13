@@ -12,11 +12,11 @@
 #include "cbnotif.h"
 // TODO: hook inode_operation.trucate
 
-#define MOD_NAME "first"
+#define MOD_NAME "cbnotif"
 #define DRIVER_AUTHOR "Daneel S. Yaitskov <rtfm.rtfm.rtfm@gmail.com>"
 #define DRIVER_DESC   "A notifier of changed file blocks"
 #define SUCCESS 0
-#define FIRST_DEV_NUM 0
+#define CBNOTIF_DEV_NUM 0
 #define DEV_NUM_RANGE 1
 #define MAX_REQUEST_SIZE PAGE_SIZE
 // implementation of character device for interface with process
@@ -31,12 +31,12 @@ static ssize_t aio_write_inode(struct kiocb *, const struct iovec *, unsigned lo
 static ssize_t sendpage_inode(struct file *, struct page *, int, size_t, loff_t *, int);
 static ssize_t splice_write_inode(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);  
 
-static struct first_monitored_inode * get_mi_by_file(struct file *);
-//static int first_find_inode(const char __user *, struct path *, unsigned);
+static struct cbnotif_monitored_inode * get_mi_by_file(struct file *);
+//static int cbnotif_find_inode(const char __user *, struct path *, unsigned);
 /**
  * serving process.
  */
-struct first_monitoring_process {
+struct cbnotif_monitoring_process {
   struct list_head   next_process;
   struct mutex       mp_mutex;   /** sync threads of the process */
   long               pid;
@@ -46,7 +46,7 @@ struct first_monitoring_process {
 /**
  * a file monitored by a process
  */
-struct first_monitored_inode {
+struct cbnotif_monitored_inode {
   struct list_head   next_inode;
   struct inode *     inode;  // inode of monitored file
   struct mutex       mi_mutex; // modification the file from multiple processes
@@ -71,7 +71,7 @@ struct first_monitored_inode {
 /**
  * continuous range of dirty blocks
  */
-struct first_dirty_block {
+struct cbnotif_dirty_block {
   struct list_head    next;
   int                 first;  /* the zero-based number of the first block in the continuous range. */
   int                 length; /* the size of the continuous range in blocks */
@@ -79,7 +79,7 @@ struct first_dirty_block {
 
 //  module vars 
 static struct mutex mp_list_mutex; /* sync mp_list structure modification */
-static struct list_head mp_list;   /* list of first_monitoring_process */
+static struct list_head mp_list;   /* list of cbnotif_monitoring_process */
 static dev_t dev_num_region;
 static struct cdev  module_dev;
 static struct class * dev_class;
@@ -92,13 +92,13 @@ static struct file_operations mod_dev_ops = {
   .release = release_device
 };
 
-static int __init first_init(void) {
+static int __init cbnotif_init(void) {
   int r;
   printk(KERN_INFO MOD_NAME ": start init\n");
   mutex_init(&mp_list_mutex);
   INIT_LIST_HEAD(&mp_list);
 
-  r = alloc_chrdev_region(&dev_num_region, FIRST_DEV_NUM, DEV_NUM_RANGE, "cbnotifier");
+  r = alloc_chrdev_region(&dev_num_region, CBNOTIF_DEV_NUM, DEV_NUM_RANGE, "cbnotifier");
   if (r < 0) {
     printk(KERN_ALERT MOD_NAME ": alloc_chrdev_region = %d\n", r);
     goto err;
@@ -131,7 +131,7 @@ static int __init first_init(void) {
   return r;
 }
 
-static void __exit first_cleanup(void) {
+static void __exit cbnotif_cleanup(void) {
   printk(KERN_INFO MOD_NAME ": cleanup start\n");
   cdev_del(&module_dev);
   device_destroy(dev_class, dev_num_region);
@@ -142,27 +142,27 @@ static void __exit first_cleanup(void) {
 
 static int open_device(struct inode * inode, struct file * file) {
   struct list_head * mp;
-  struct first_monitoring_process * _mp;
+  struct cbnotif_monitoring_process * _mp;
   struct task_struct * task;
   pid_t pid;
   task = get_current();
   pid = task->pid;
-  printk(KERN_INFO "first: open_device inode = %p; file = %p; pid = %d\n", inode, file, pid);
+  printk(KERN_INFO "cbnotif: open_device inode = %p; file = %p; pid = %d\n", inode, file, pid);
   
   mutex_lock(&mp_list_mutex);
   list_for_each(mp, &mp_list) {
-    _mp = (struct first_monitoring_process *)mp;
+    _mp = (struct cbnotif_monitoring_process *)mp;
     if (_mp->pid == pid) {
-      printk(KERN_INFO "first: process %d already opened this file driver\n", pid);
+      printk(KERN_INFO "cbnotif: process %d already opened this file driver\n", pid);
       break;
     }
   }
 
   if (&mp_list == mp) {
     // add new
-    _mp = (struct first_monitoring_process *)kmalloc(sizeof(struct first_monitoring_process), GFP_KERNEL);
+    _mp = (struct cbnotif_monitoring_process *)kmalloc(sizeof(struct cbnotif_monitoring_process), GFP_KERNEL);
     if (!_mp) {
-      printk(KERN_ALERT "first: no memory\n");
+      printk(KERN_ALERT "cbnotif: no memory\n");
       mutex_unlock(&mp_list_mutex);
       return -ENOMEM;
     }
@@ -171,9 +171,9 @@ static int open_device(struct inode * inode, struct file * file) {
     INIT_LIST_HEAD(&_mp->next_process);
     try_module_get(THIS_MODULE);
     list_add((struct list_head*)_mp, &mp_list);
-    printk(KERN_INFO "first: process %d successfully opened file\n", pid);    
+    printk(KERN_INFO "cbnotif: process %d successfully opened file\n", pid);    
   } else {
-    printk(KERN_INFO "first: process %d already opened file\n", pid);        
+    printk(KERN_INFO "cbnotif: process %d already opened file\n", pid);        
   }
 
   mutex_unlock(&mp_list_mutex);
@@ -182,37 +182,37 @@ static int open_device(struct inode * inode, struct file * file) {
 
 static int release_device(struct inode * inode, struct file * file) {
   struct list_head * mp, * mi;
-  struct first_monitoring_process * _mp;
-  struct first_monitored_inode    * _mi;
+  struct cbnotif_monitoring_process * _mp;
+  struct cbnotif_monitored_inode    * _mi;
   struct file_operations * fops;  
   pid_t pid = get_current()->pid;
-  printk(KERN_INFO "first: release_device inode = %p; file = %p; pid = %d\n", inode, file, pid);
+  printk(KERN_INFO "cbnotif: release_device inode = %p; file = %p; pid = %d\n", inode, file, pid);
 
   mutex_lock(&mp_list_mutex);
   if (list_empty(&mp_list)) {
-    printk(KERN_WARNING "first: something wong - close closed file pid = %d\n", pid);
+    printk(KERN_WARNING "cbnotif: something wong - close closed file pid = %d\n", pid);
     mutex_unlock(&mp_list_mutex);
     return -EBADF;
   }
 
   list_for_each(mp, &mp_list) {
-    _mp = (struct first_monitoring_process*)mp;
+    _mp = (struct cbnotif_monitoring_process*)mp;
     if (_mp->pid == pid) {
       break;
     }
   }
   if (&mp_list == mp) {
-    printk(KERN_WARNING "first: something wong - close closed file pid = %d\n", pid);    
+    printk(KERN_WARNING "cbnotif: something wong - close closed file pid = %d\n", pid);    
     mutex_unlock(&mp_list_mutex);
     return -EBADF;
   }    
   list_del(mp);
   mutex_unlock(&mp_list_mutex);
-  printk(KERN_INFO "first: process %d is removed from the list\n", pid);
+  printk(KERN_INFO "cbnotif: process %d is removed from the list\n", pid);
   mutex_lock(&_mp->mp_mutex);
   // need to ensure that other threads of current process already gone.
   list_for_each(mi, &_mp->monitored_inodes) {
-    _mi = (struct first_monitored_inode*)mi;
+    _mi = (struct cbnotif_monitored_inode*)mi;
     if (mi->prev != &_mp->monitored_inodes) {
       kfree(mi->prev);
     }
@@ -253,7 +253,7 @@ static int release_device(struct inode * inode, struct file * file) {
 static ssize_t read_device(struct file * file, char * buf, size_t bufsize, loff_t * ofs) {
   char * command;
   long copied;
-  printk(KERN_INFO "first: read_device file = %p; buf = %p; bufsize = %d\n", file, buf, bufsize);    
+  printk(KERN_INFO "cbnotif: read_device file = %p; buf = %p; bufsize = %d\n", file, buf, bufsize);    
   command = (char*)kmalloc(bufsize, GFP_KERNEL);
   if (!command) {
     return -ENOMEM;
@@ -266,25 +266,25 @@ static ssize_t read_device(struct file * file, char * buf, size_t bufsize, loff_
   command[copied-1] = '\0';
   switch (*command) {
   case 'm': // Monitore new file
-    printk(KERN_INFO "first: pid = %d sent command monitor file '%s' with block size %ld\n",
+    printk(KERN_INFO "cbnotif: pid = %d sent command monitor file '%s' with block size %ld\n",
            get_current()->pid,
            command + (sizeof(char) + sizeof(long)),
            *(long*)(command + sizeof(char)));    
     break;
   case 'c': // get Changes
-    printk(KERN_INFO "first: pid = %d sent command get changes of %ld\n",
+    printk(KERN_INFO "cbnotif: pid = %d sent command get changes of %ld\n",
            get_current()->pid,
            *(long*)(command+sizeof(char)));    
     break;
   case 'f': // Forget about monitored file
-    printk(KERN_INFO "first: pid = %d sent command forget\n", get_current()->pid);
+    printk(KERN_INFO "cbnotif: pid = %d sent command forget\n", get_current()->pid);
     break;
   default:
-    printk(KERN_ALERT "first: pid = %d sent invalid command %c(%d)\n", get_current()->pid, *command, *command), 
+    printk(KERN_ALERT "cbnotif: pid = %d sent invalid command %c(%d)\n", get_current()->pid, *command, *command), 
     kfree(command);
     return -EINVAL;
   }
-  printk(KERN_INFO "first: read_device string %s\n", command);
+  printk(KERN_INFO "cbnotif: read_device string %s\n", command);
   kfree(command);
   return bufsize;  
 }
@@ -311,14 +311,14 @@ static ssize_t read_device(struct file * file, char * buf, size_t bufsize, loff_
  *                                       Second element is the number of end block.
  */  
 static ssize_t write_device(struct file * file, const char * buf, size_t bufsize, loff_t * ofs) {
-  printk(KERN_INFO "first: write_device file = %p\n", file);    
+  printk(KERN_INFO "cbnotif: write_device file = %p\n", file);    
   return bufsize;  
 }
 
 
 static ssize_t write_inode(struct file * file, const char __user * data, size_t len, loff_t * ofs) {
-  struct first_monitored_inode * mi = 0;
-  printk(KERN_INFO "first: write_inode file = %p; len = %u\n", file, len);
+  struct cbnotif_monitored_inode * mi = 0;
+  printk(KERN_INFO "cbnotif: write_inode file = %p; len = %u\n", file, len);
   mi = get_mi_by_file(file);
   if (mi) {
     ssize_t (*writep) (struct file *, const char __user *, size_t, loff_t *);
@@ -330,8 +330,8 @@ static ssize_t write_inode(struct file * file, const char __user * data, size_t 
   return -ENXIO;
 }
 static ssize_t aio_write_inode(struct kiocb * kiocb, const struct iovec * iovec, unsigned long len, loff_t ofs) {
-  struct first_monitored_inode * mi = 0;
-  printk(KERN_INFO "first: aio_write_inode file = %p; len = %ld\n", kiocb->ki_filp, len);
+  struct cbnotif_monitored_inode * mi = 0;
+  printk(KERN_INFO "cbnotif: aio_write_inode file = %p; len = %ld\n", kiocb->ki_filp, len);
   mi = get_mi_by_file(kiocb->ki_filp);
   if (mi) {
     ssize_t (*aio_writep)(struct kiocb *, const struct iovec *, unsigned long, loff_t);
@@ -344,8 +344,8 @@ static ssize_t aio_write_inode(struct kiocb * kiocb, const struct iovec * iovec,
 }
 
 static ssize_t sendpage_inode(struct file * file, struct page * page, int i1, size_t s, loff_t * ofs, int i2) {
-  struct first_monitored_inode * mi = 0;
-  printk(KERN_INFO "first: aio_write_inode file = %p\n", file);
+  struct cbnotif_monitored_inode * mi = 0;
+  printk(KERN_INFO "cbnotif: aio_write_inode file = %p\n", file);
   mi = get_mi_by_file(file);
   if (mi) {
     ssize_t (*sendpagep)(struct file *, struct page *, int, size_t, loff_t *, int);
@@ -359,8 +359,8 @@ static ssize_t sendpage_inode(struct file * file, struct page * page, int i1, si
 
 static ssize_t splice_write_inode(struct pipe_inode_info * pipe, struct file * file,
                                   loff_t * ofs, size_t s, unsigned int ui) {
-  struct first_monitored_inode * mi = 0;
-  printk(KERN_INFO "first: aio_write_inode file = %p\n", file);
+  struct cbnotif_monitored_inode * mi = 0;
+  printk(KERN_INFO "cbnotif: aio_write_inode file = %p\n", file);
   mi = get_mi_by_file(file);
   if (mi) {
     ssize_t (*splice_writep)(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);
@@ -373,33 +373,33 @@ static ssize_t splice_write_inode(struct pipe_inode_info * pipe, struct file * f
 }
 
 /**
- * first_monitored_inode - returns first_monitored_inode for the specified file
+ * cbnotif_monitored_inode - returns cbnotif_monitored_inode for the specified file
  * @file: pointer to the struct file
  *
  * Returns 0 if file's inod is not found amoung monitored ones
  */ 
-static struct first_monitored_inode * get_mi_by_file(struct file * file) {
+static struct cbnotif_monitored_inode * get_mi_by_file(struct file * file) {
   struct list_head * mi;
-  struct first_monitored_inode * _mi;  
+  struct cbnotif_monitored_inode * _mi;  
   struct list_head * mp;
-  struct first_monitoring_process * _mp;  
+  struct cbnotif_monitoring_process * _mp;  
   int found = 0;
   spin_lock(&file->f_lock);
-  printk(KERN_INFO "first: file spin is locked; file = %p;  name = %s\n",
+  printk(KERN_INFO "cbnotif: file spin is locked; file = %p;  name = %s\n",
          file, file->f_path.dentry->d_name.name);
   spin_lock(&file->f_path.dentry->d_lock);
-  printk(KERN_INFO "first: dentry spin is locked; file = %p; name = %s\n",
+  printk(KERN_INFO "cbnotif: dentry spin is locked; file = %p; name = %s\n",
          file, file->f_path.dentry->d_name.name);
   mutex_lock(&mp_list_mutex);
   // sequential search; slow but simple!
   // FIXME:  one inode can be monitored multiple processes here 
-  //         handler is trigged only the first monitor
-  printk(KERN_INFO "first: go over list of montors\n");
+  //         handler is trigged only the cbnotif monitor
+  printk(KERN_INFO "cbnotif: go over list of montors\n");
   list_for_each(mp, &mp_list) {
-    _mp = (struct first_monitoring_process*)mp;
+    _mp = (struct cbnotif_monitoring_process*)mp;
     mutex_lock(&_mp->mp_mutex);
     list_for_each(mi, &_mp->monitored_inodes) {
-      _mi = (struct first_monitored_inode*)mi;
+      _mi = (struct cbnotif_monitored_inode*)mi;
       mutex_lock(&_mi->mi_mutex);
       if (_mi->inode == file->f_path.dentry->d_inode) {
         found = 1;        
@@ -413,18 +413,18 @@ static struct first_monitored_inode * get_mi_by_file(struct file * file) {
   }
   mutex_unlock(&mp_list_mutex);
   spin_unlock(&file->f_path.dentry->d_lock);
-  printk(KERN_INFO "first dentry spin is unlocked; file = %p\n", file); 
+  printk(KERN_INFO "cbnotif dentry spin is unlocked; file = %p\n", file); 
   spin_lock(&file->f_lock);
-  printk(KERN_INFO "first: file spin is unlocked; file = %p\n", file); 
+  printk(KERN_INFO "cbnotif: file spin is unlocked; file = %p\n", file); 
   if (found) {
-    printk(KERN_INFO "first: inode %p found for file %p\n", _mi->inode, file);
+    printk(KERN_INFO "cbnotif: inode %p found for file %p\n", _mi->inode, file);
     return _mi;    
   }
-  printk(KERN_INFO "first: inode %p is not found for file %p\n", _mi->inode, file);  
+  printk(KERN_INFO "cbnotif: inode %p is not found for file %p\n", _mi->inode, file);  
   return 0;
 }
 
-/* static int first_find_inode(const char __user *dirname, struct path *path, unsigned flags) { */
+/* static int cbnotif_find_inode(const char __user *dirname, struct path *path, unsigned flags) { */
 /* 	int error; */
 
 /* 	error = user_path_at(AT_FDCWD, dirname, flags, path); */
@@ -438,8 +438,8 @@ static struct first_monitored_inode * get_mi_by_file(struct file * file) {
 /* } */
 
 
-module_init(first_init);
-module_exit(first_cleanup);
+module_init(cbnotif_init);
+module_exit(cbnotif_cleanup);
 
 
 MODULE_LICENSE("GPL v2");
