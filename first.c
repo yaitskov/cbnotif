@@ -4,11 +4,12 @@
 #include <linux/moduleparam.h>
 #include <linux/fs.h>
 #include <linux/mutex.h>
-#include <linux/slab.h>
+
 #include <linux/syscalls.h>
 #include <linux/cdev.h>
 #include <linux/device.h>
-
+#include <linux/slab.h>
+#include "cbnotif.h"
 // TODO: hook inode_operation.trucate
 
 #define MOD_NAME "first"
@@ -17,7 +18,7 @@
 #define SUCCESS 0
 #define FIRST_DEV_NUM 0
 #define DEV_NUM_RANGE 1
-
+#define MAX_REQUEST_SIZE PAGE_SIZE
 // implementation of character device for interface with process
 static int open_device(struct inode *, struct file *);
 static int release_device(struct inode *, struct file *);
@@ -31,7 +32,7 @@ static ssize_t sendpage_inode(struct file *, struct page *, int, size_t, loff_t 
 static ssize_t splice_write_inode(struct pipe_inode_info *, struct file *, loff_t *, size_t, unsigned int);  
 
 static struct first_monitored_inode * get_mi_by_file(struct file *);
-
+//static int first_find_inode(const char __user *, struct path *, unsigned);
 /**
  * serving process.
  */
@@ -236,13 +237,82 @@ static int release_device(struct inode * inode, struct file * file) {
   
   return SUCCESS;  
 }
+/**
+ * read_device - reads a command from a process and executed it.
+ *
+ * Format of commands (binary):
+ *  1) monitor: "m" <block-size> <path-to-file>
+ *  2) forget:  "f" <id-of-file>
+ *  3) changes: "c" <id-of-file>
+ *  <id-of-file>   long type. numeric id of the monitored file allocated
+ *                 as result of "monitor" command
+ *  <path-to-file> absolute path to file starting with right slash and terminated with 0
+ *  <block-size>   long type. a size of block a monitored file is divided for
+ *                 than less it then you got more precision
+ */
 static ssize_t read_device(struct file * file, char * buf, size_t bufsize, loff_t * ofs) {
+  char * command;
+  long copied;
   printk(KERN_INFO "first: read_device file = %p; buf = %p; bufsize = %d\n", file, buf, bufsize);    
-  return 0;  
+  command = (char*)kmalloc(bufsize, GFP_KERNEL);
+  if (!command) {
+    return -ENOMEM;
+  }
+  copied = copy_from_user(command, buf, bufsize);
+  if (copied < bufsize) {
+    kfree(command);
+    return -EINVAL;
+  }
+  command[copied-1] = '\0';
+  switch (*command) {
+  case 'm': // Monitore new file
+    printk(KERN_INFO "first: pid = %d sent command monitor file '%s' with block size %ld\n",
+           get_current()->pid,
+           command + (sizeof(char) + sizeof(long)),
+           *(long*)(command + sizeof(char)));    
+    break;
+  case 'c': // get Changes
+    printk(KERN_INFO "first: pid = %d sent command get changes of %ld\n",
+           get_current()->pid,
+           *(long*)(command+sizeof(char)));    
+    break;
+  case 'f': // Forget about monitored file
+    printk(KERN_INFO "first: pid = %d sent command forget\n", get_current()->pid);
+    break;
+  default:
+    printk(KERN_ALERT "first: pid = %d sent invalid command %c(%d)\n", get_current()->pid, *command, *command), 
+    kfree(command);
+    return -EINVAL;
+  }
+  printk(KERN_INFO "first: read_device string %s\n", command);
+  kfree(command);
+  return bufsize;  
 }
+
+/**
+ * write_device - returns results of excecuted commands got from read_device() to a process
+ *
+ * Format of commands' output(binary):
+ * monitor => byte 'm', <id-of-file> (long type) or error if it's less than 0 there are:
+ *                         -EPERM, -ENOENT, -E2BIG, -EINVAL, -ENOMEM, -EACCESS, -ENAMETOOLONG
+ *                             
+ * forget  => byte 'f', (long type) 0 ok or an error otherwise -EBADF
+ * changes => byte 'c'
+ *            The first long number is a code:
+ *                    0 - ok;
+ *                    1 - file has been truncated, one range with 1 - number of last block;
+ *                    2 - overflow (the module wasn't have enough memory to remember all changes
+ *                                  and it had to extend existing ranges to comprehend new blocks;
+ *                                  This is a signal to pull the numbers of changed blocks more quickly)
+ *            The second long number is the number of single changed blocks
+ *            The thrid long number is the number of chagned block ranges
+ *            Next long numbers are the numbers of single changed block
+ *            Next pairs of long number. First element is the number of start block.
+ *                                       Second element is the number of end block.
+ */  
 static ssize_t write_device(struct file * file, const char * buf, size_t bufsize, loff_t * ofs) {
   printk(KERN_INFO "first: write_device file = %p\n", file);    
-  return 0;  
+  return bufsize;  
 }
 
 
@@ -353,6 +423,20 @@ static struct first_monitored_inode * get_mi_by_file(struct file * file) {
   printk(KERN_INFO "first: inode %p is not found for file %p\n", _mi->inode, file);  
   return 0;
 }
+
+/* static int first_find_inode(const char __user *dirname, struct path *path, unsigned flags) { */
+/* 	int error; */
+
+/* 	error = user_path_at(AT_FDCWD, dirname, flags, path); */
+/* 	if (error) */
+/* 		return error; */
+/* 	/\* you can only watch an inode if you have read permissions on it *\/ */
+/* 	error = inode_permission(path->dentry->d_inode, MAY_READ); */
+/* 	if (error) */
+/* 		path_put(path); */
+/* 	return error; */
+/* } */
+
 
 module_init(first_init);
 module_exit(first_cleanup);
